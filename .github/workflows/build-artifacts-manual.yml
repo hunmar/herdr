@@ -31,13 +31,20 @@ on:
         options:
           - 'false'
           - 'true'
+      publish_release:
+        description: publish selected artifacts as an isolated test prerelease
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  actions: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HERDR_BUILD_CHANNEL: test
+  HERDR_BUILD_COMMIT: ${{ github.sha }}
+  HERDR_BUILD_ID: ${{ github.run_id }}.${{ github.run_attempt }}
   RUST_TOOLCHAIN_VERSION: 1.96.1
 
 jobs:
@@ -247,3 +254,40 @@ jobs:
             herdr-windows-x86_64.zip
             BUILD_INFO.txt
           retention-days: 7
+
+  publish-test-release:
+    if: ${{ always() && inputs.publish_release && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+
+      - name: Publish isolated test prerelease
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          tag_name: test-${{ github.run_id }}-${{ github.run_attempt }}
+          name: Test build ${{ github.ref_name }} · run ${{ github.run_id }}.${{ github.run_attempt }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          body: |
+            Test build from `${{ github.ref }}` at `${{ github.sha }}`.
+
+            - Build channel: `test`
+            - Build ID: `${{ github.run_id }}.${{ github.run_attempt }}`
+            - Build group: `${{ inputs.build_group }}`
+            - libghostty-vt optimize: `${{ inputs.libghostty_optimize }}`
+            - libghostty-vt SIMD: `${{ inputs.libghostty_simd }}`
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            This prerelease is isolated from stable `v*` and preview `preview-*` channels.
+          files: |
+            artifacts/**/herdr-*
