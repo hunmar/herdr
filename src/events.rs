@@ -159,4 +159,6 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+    /// A configured read-only remote Herdr source changed availability or agent state.
+    RemoteAgentsUpdated(Box<crate::remote_agents::RemoteAgentUpdate>),
 }

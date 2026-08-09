@@ -87,6 +87,7 @@ mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod remote_agents;
 mod render_prof;
 mod render_signal;
 mod selection;
@@ -405,6 +406,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
+
+# Show agents from an existing Herdr session on another machine. Background
+# observation is read-only and non-interactive: first connect to the host
+# normally so its host key and authentication are already configured.
+# [[remote.agent_sources]]
+# target = "devbox"       # OpenSSH config alias or user@host
+# label = "devbox"        # optional; defaults to target
+# session = "default"
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.

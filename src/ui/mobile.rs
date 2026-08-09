@@ -9,7 +9,7 @@ use ratatui::{
 use super::sidebar::{
     agent_panel_entries, agent_panel_entries_from, grouped_child_display_label,
     next_entry_is_indented_workspace, workspace_list_entries_expanded, AgentPanelEntry,
-    WorkspaceListEntry,
+    AgentPanelTarget, WorkspaceListEntry,
 };
 use super::status::{state_icon, state_icon_symbol};
 use super::text::{display_width_u16, truncate_end};
@@ -17,6 +17,7 @@ use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
 use crate::config::StatusIndicatorStyle;
 use crate::detect::AgentState;
+#[cfg(test)]
 use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
@@ -33,17 +34,13 @@ pub(crate) struct MobileSwitcherAreas {
     pub viewport: Rect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MobileSwitcherTarget {
     NewWorkspace,
     Workspace(usize),
     NewTab,
     Tab(usize),
-    Agent {
-        ws_idx: usize,
-        tab_idx: usize,
-        pane_id: PaneId,
-    },
+    Agent(AgentPanelTarget),
     Menu(usize),
 }
 
@@ -100,7 +97,9 @@ pub(crate) fn mobile_switcher_max_scroll_for_height(app: &AppState, viewport_hei
 fn mobile_agents_block_height(app: &AppState) -> usize {
     let count = agent_panel_entries(app).len();
     if count == 0 {
-        usize::from(app.agent_view_override.is_some()) * 2
+        usize::from(
+            app.agent_view_override.is_some() || app.remote_agents.unavailable_source_count() > 0,
+        ) * 2
     } else {
         1 + count * 2
     }
@@ -148,7 +147,10 @@ pub(crate) fn mobile_switcher_target_at(
     // Agents lead the switcher: the primary job is switching between running
     // agents. Spaces/tabs/create actions follow for navigation and management.
     let agents = agent_panel_entries(app);
-    if !agents.is_empty() || app.agent_view_override.is_some() {
+    if !agents.is_empty()
+        || app.agent_view_override.is_some()
+        || app.remote_agents.unavailable_source_count() > 0
+    {
         cursor += 1; // agents title
         if agents.is_empty() {
             cursor += 1; // active-query empty state
@@ -156,11 +158,9 @@ pub(crate) fn mobile_switcher_target_at(
             let agents_end = cursor + agents.len() * 2;
             if doc_row >= cursor && doc_row < agents_end {
                 let idx = (doc_row - cursor) / 2;
-                return agents.get(idx).map(|entry| MobileSwitcherTarget::Agent {
-                    ws_idx: entry.ws_idx,
-                    tab_idx: entry.tab_idx,
-                    pane_id: entry.pane_id,
-                });
+                return agents
+                    .get(idx)
+                    .map(|entry| MobileSwitcherTarget::Agent(entry.target.clone()));
             }
             cursor = agents_end;
         }
@@ -477,12 +477,15 @@ fn render_mobile_switcher_content(
 
     let p = &app.palette;
     let total_height = mobile_switcher_content_height(app);
+    let scroll = app
+        .mobile_switcher_scroll
+        .min(total_height.saturating_sub(viewport.height as usize));
     render_left_scrollbar(
         frame,
         viewport,
         total_height,
         viewport.height as usize,
-        app.mobile_switcher_scroll,
+        scroll,
         p,
     );
     let content = inset_for_left_scrollbar(viewport);
@@ -493,26 +496,22 @@ fn render_mobile_switcher_content(
     let mut doc_y = 0usize;
 
     let entries = agent_panel_entries_from(app, terminal_runtimes);
-    if !entries.is_empty() || app.agent_view_override.is_some() {
+    let unavailable_sources = app.remote_agents.unavailable_source_count();
+    if !entries.is_empty() || app.agent_view_override.is_some() || unavailable_sources > 0 {
         let focused_agent = app.active.and_then(|ws_idx| {
             let ws = app.workspaces.get(ws_idx)?;
             ws.focused_pane_id()
                 .map(|pane_id| (ws_idx, ws.active_tab, pane_id))
         });
-        let title = app
+        let mut title = app
             .agent_view_override
             .as_ref()
             .map(|view| format!("agents · {}", view.label.as_deref().unwrap_or("filtered")))
             .unwrap_or_else(|| "agents".to_string());
-        render_section_title_at(
-            frame,
-            viewport,
-            content,
-            doc_y,
-            app.mobile_switcher_scroll,
-            &title,
-            p,
-        );
+        if unavailable_sources > 0 {
+            title.push_str(&format!(" · {unavailable_sources} unavailable"));
+        }
+        render_section_title_at(frame, viewport, content, doc_y, scroll, &title, p);
         doc_y += 1;
         if entries.is_empty() {
             render_one_line_item(
@@ -520,18 +519,22 @@ fn render_mobile_switcher_content(
                 viewport,
                 content,
                 doc_y,
-                app.mobile_switcher_scroll,
+                scroll,
                 ratatui::style::Color::Reset,
                 Line::from(Span::styled(
-                    "  no matching agents",
+                    if app.agent_view_override.is_some() {
+                        "  no matching agents"
+                    } else {
+                        "  waiting for remote agents"
+                    },
                     Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
                 )),
             );
             doc_y += 1;
         }
         for entry in &entries {
-            let active = focused_agent.is_some_and(|(ws_idx, tab_idx, pane_id)| {
-                entry.ws_idx == ws_idx && entry.tab_idx == tab_idx && entry.pane_id == pane_id
+            let active = focused_agent.is_some_and(|focused| {
+                entry.local_target().is_some_and(|target| target == focused)
             });
             let bg = mobile_item_bg(false, active, p);
             let (icon, icon_style) = state_icon(entry.state, entry.seen, app.status_indicators, p);
@@ -556,7 +559,7 @@ fn render_mobile_switcher_content(
                 viewport,
                 content,
                 doc_y,
-                app.mobile_switcher_scroll,
+                scroll,
                 bg,
                 title,
                 truncate_end(&detail, content.width as usize),
@@ -566,22 +569,14 @@ fn render_mobile_switcher_content(
         }
     }
 
-    render_section_title_at(
-        frame,
-        viewport,
-        content,
-        doc_y,
-        app.mobile_switcher_scroll,
-        "spaces",
-        p,
-    );
+    render_section_title_at(frame, viewport, content, doc_y, scroll, "spaces", p);
     doc_y += 1;
     render_action_row_at(
         frame,
         viewport,
         content,
         doc_y,
-        app.mobile_switcher_scroll,
+        scroll,
         "+ new workspace",
         p,
     );
@@ -649,7 +644,7 @@ fn render_mobile_switcher_content(
             viewport,
             content,
             doc_y,
-            app.mobile_switcher_scroll,
+            scroll,
             bg,
             Line::from(title_spans),
             truncate_end(&detail, content.width as usize),
@@ -659,25 +654,9 @@ fn render_mobile_switcher_content(
     }
 
     if let Some(ws) = app.active.and_then(|idx| app.workspaces.get(idx)) {
-        render_section_title_at(
-            frame,
-            viewport,
-            content,
-            doc_y,
-            app.mobile_switcher_scroll,
-            "tabs",
-            p,
-        );
+        render_section_title_at(frame, viewport, content, doc_y, scroll, "tabs", p);
         doc_y += 1;
-        render_action_row_at(
-            frame,
-            viewport,
-            content,
-            doc_y,
-            app.mobile_switcher_scroll,
-            "+ new tab",
-            p,
-        );
+        render_action_row_at(frame, viewport, content, doc_y, scroll, "+ new tab", p);
         doc_y += 1;
         for (idx, tab) in ws.tabs.iter().enumerate() {
             let active = idx == ws.active_tab;
@@ -700,31 +679,15 @@ fn render_mobile_switcher_content(
                         .add_modifier(Modifier::BOLD),
                 ),
             ]);
-            render_one_line_item(
-                frame,
-                viewport,
-                content,
-                doc_y,
-                app.mobile_switcher_scroll,
-                bg,
-                title,
-            );
+            render_one_line_item(frame, viewport, content, doc_y, scroll, bg, title);
             doc_y += 1;
         }
     }
 
-    render_section_title_at(
-        frame,
-        viewport,
-        content,
-        doc_y,
-        app.mobile_switcher_scroll,
-        "menu",
-        p,
-    );
+    render_section_title_at(frame, viewport, content, doc_y, scroll, "menu", p);
     doc_y += 1;
     for label in app.global_menu_labels() {
-        if let Some(y) = visible_y(viewport, app.mobile_switcher_scroll, doc_y) {
+        if let Some(y) = visible_y(viewport, scroll, doc_y) {
             frame.render_widget(
                 Paragraph::new(format!("  {label}"))
                     .style(Style::default().fg(p.overlay1).bg(p.panel_bg)),
@@ -1120,7 +1083,21 @@ fn fit_summary_segments(
 }
 
 fn agent_summary_line(app: &AppState, p: &Palette, max_width: u16) -> Line<'static> {
-    let segments = agent_summary_segments(global_agent_counts(app), app.status_indicators);
+    let counts = global_agent_counts(app);
+    let unavailable_sources = app.remote_agents.unavailable_source_count();
+    let mut segments = agent_summary_segments(counts, app.status_indicators);
+    if unavailable_sources > 0 {
+        if counts.total() == 0 {
+            segments.clear();
+        }
+        segments.push((
+            format!(
+                "{unavailable_sources} source{} unavailable",
+                if unavailable_sources == 1 { "" } else { "s" }
+            ),
+            SummaryTone::Muted,
+        ));
+    }
     let (shown, truncated) = fit_summary_segments(segments, max_width as usize);
 
     let mut spans = vec![Span::styled(" ", Style::default().bg(p.panel_bg))];
@@ -1210,9 +1187,15 @@ mod tests {
 
     fn agent_entry(primary_tab_label: Option<&str>, agent_label: Option<&str>) -> AgentPanelEntry {
         AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: PaneId::from_raw(1),
+            target: AgentPanelTarget::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: PaneId::from_raw(1),
+            },
+            view_workspace_id: "w1".into(),
+            view_tab_id: "w1:t1".into(),
+            view_pane_id: "w1:p1".into(),
+            order: (0, 0, 0, 0),
             primary_label: "herdr".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             pane_label: None,
@@ -1420,12 +1403,100 @@ mod tests {
         let viewport = mobile_switcher_areas(&app).viewport;
         app.mobile_switcher_scroll = 100;
         let agent_hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 1);
-        assert!(matches!(
-            agent_hit,
-            Some(MobileSwitcherTarget::Agent { .. })
-        ));
+        assert!(matches!(agent_hit, Some(MobileSwitcherTarget::Agent(_))));
         let workspace_hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 7);
         assert_eq!(workspace_hit, Some(MobileSwitcherTarget::Workspace(0)));
+
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_mobile_switcher_content(&app, &runtimes, frame, viewport);
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("agents-first"));
+    }
+
+    #[test]
+    fn unavailable_remote_source_is_visible_without_cached_agents() {
+        let mut app = crate::app::state::AppState::test_new();
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        app.remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: crate::remote_agents::RemoteHostKey::for_source(&source),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+
+        assert_eq!(mobile_agents_block_height(&app), 2);
+        let line = agent_summary_line(&app, &app.palette, 80);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("1 source unavailable"));
+    }
+
+    #[test]
+    fn active_agent_filter_empty_state_wins_over_unavailable_source_waiting_state() {
+        let mut app = crate::app::state::AppState::test_new();
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        app.remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: crate::remote_agents::RemoteHostKey::for_source(&source),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+        app.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
+            source: "test.filter".into(),
+            label: Some("filtered".into()),
+            filter: None,
+            sort: Vec::new(),
+        });
+        app.view.mobile_header_rect = Rect::new(0, 0, 40, 2);
+        app.view.terminal_area = Rect::new(0, 2, 40, 18);
+        let viewport = mobile_switcher_areas(&app).viewport;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_mobile_switcher_content(
+                    &app,
+                    &crate::terminal::TerminalRuntimeRegistry::new(),
+                    frame,
+                    viewport,
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("no matching agents"));
+        assert!(!rendered.contains("waiting for remote agents"));
     }
 
     fn worktree_workspace(name: &str, key: &str, linked: bool) -> crate::workspace::Workspace {

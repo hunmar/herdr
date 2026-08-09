@@ -107,6 +107,19 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+To include agents from another machine in the local Agents sidebar, add a read-only source for its running Herdr session:
+
+```toml
+[[remote.agent_sources]]
+target = "devbox"       # OpenSSH config alias or user@host
+label = "devbox"        # optional; defaults to target
+session = "default"
+```
+
+Herdr keeps one non-interactive SSH observer per source and reads the remote session snapshot every two seconds. Up to 32 sources can be configured. The remote machine must run Linux or macOS, have a protocol-compatible Herdr on `PATH` or in a standard install location, and already have the selected session running. Connect normally with `ssh devbox` or `herdr --remote devbox` first to accept the host key and configure authentication; background observers never prompt for passwords or host-key approval. Remote rows are display-only in this first version. When a connection drops, the last known rows remain visible as offline, and local agent shortcuts continue to target local panes only.
+
+Named sessions are shown as `<label>/<session>` so two sessions on the same machine remain distinguishable. Fleet labels must be unique.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

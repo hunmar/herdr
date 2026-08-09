@@ -42,6 +42,9 @@ pub struct TabInfo {
     pub workspace_id: String,
     pub number: usize,
     pub label: String,
+    /// True when `label` was explicitly assigned instead of generated from the tab position.
+    #[serde(default)]
+    pub custom_label: bool,
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,

@@ -10,6 +10,7 @@ use super::{
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
+const MAX_REMOTE_AGENT_TARGET_CHARS: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -903,18 +904,209 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Read-only Herdr sessions whose agents are projected into the local fleet view.
+    pub agent_sources: Vec<RemoteAgentSourceConfig>,
+    agent_source_indices: Vec<usize>,
+    agent_source_count: usize,
+    agent_source_parse_diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RemoteAgentSourceConfig {
+    /// OpenSSH destination or config alias.
+    pub target: String,
+    /// Human-readable machine label. Defaults to `target`.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Remote Herdr session to observe. Default: "default".
+    #[serde(default = "default_remote_agent_session")]
+    pub session: String,
+}
+
+fn default_remote_agent_session() -> String {
+    crate::session::DEFAULT_SESSION_NAME.to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawRemoteConfig {
+    manage_ssh_config: bool,
+    agent_sources: Vec<toml::Value>,
+}
+
+impl Default for RawRemoteConfig {
+    fn default() -> Self {
+        Self {
+            manage_ssh_config: true,
+            agent_sources: Vec::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawRemoteConfig::deserialize(deserializer)?;
+        let agent_source_count = raw.agent_sources.len();
+        let mut agent_sources = Vec::new();
+        let mut agent_source_indices = Vec::new();
+        let mut agent_source_parse_diagnostics = Vec::new();
+
+        for (index, value) in raw.agent_sources.into_iter().take(32).enumerate() {
+            if let Some(table) = value.as_table() {
+                for key in table
+                    .keys()
+                    .filter(|key| !matches!(key.as_str(), "target" | "label" | "session"))
+                {
+                    agent_source_parse_diagnostics.push(format!(
+                        "unknown config key remote.agent_sources.{index}.{key}; ignoring key"
+                    ));
+                }
+            }
+            match value.try_into::<RemoteAgentSourceConfig>() {
+                Ok(source) => {
+                    agent_sources.push(source);
+                    agent_source_indices.push(index);
+                }
+                Err(err) => agent_source_parse_diagnostics.push(format!(
+                    "invalid remote.agent_sources[{index}]: {err}; ignoring source"
+                )),
+            }
+        }
+
+        Ok(Self {
+            manage_ssh_config: raw.manage_ssh_config,
+            agent_sources,
+            agent_source_indices,
+            agent_source_count,
+            agent_source_parse_diagnostics,
+        })
+    }
+}
+
+impl RemoteAgentSourceConfig {
+    pub(crate) fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.target)
+    }
+
+    pub(crate) fn fleet_label(&self) -> String {
+        let label = self.display_label();
+        if self.session == crate::session::DEFAULT_SESSION_NAME {
+            label.to_string()
+        } else {
+            format!("{label}/{}", self.session)
+        }
+    }
+}
+
+impl RemoteConfig {
+    pub(crate) fn validated_agent_sources(&self) -> (Vec<RemoteAgentSourceConfig>, Vec<String>) {
+        let mut valid = Vec::new();
+        let mut diagnostics = self.agent_source_parse_diagnostics.clone();
+        let mut identities = std::collections::HashSet::new();
+        let mut fleet_labels = std::collections::HashSet::new();
+
+        if self.agent_source_count > 32 {
+            diagnostics.push(
+                "remote.agent_sources may contain at most 32 entries; ignoring entries after 32"
+                    .to_string(),
+            );
+        }
+
+        for (position, source) in self.agent_sources.iter().enumerate() {
+            let index = self
+                .agent_source_indices
+                .get(position)
+                .copied()
+                .unwrap_or(position);
+            let key = format!("remote.agent_sources[{index}]");
+            let target_valid = !source.target.is_empty()
+                && source.target.chars().count() <= MAX_REMOTE_AGENT_TARGET_CHARS
+                && !source.target.starts_with('-')
+                && source.target.trim() == source.target
+                && !source.target.chars().any(is_unsafe_remote_label_char)
+                && !source.target.chars().any(char::is_whitespace);
+            if !target_valid {
+                diagnostics.push(format!(
+                    "{key}.target must be a 1-{MAX_REMOTE_AGENT_TARGET_CHARS} character OpenSSH destination without leading '-', whitespace, control, or bidirectional formatting characters; ignoring source"
+                ));
+                continue;
+            }
+
+            if let Some(label) = source.label.as_deref() {
+                let label = label.trim();
+                if label.is_empty()
+                    || label.chars().count() > 64
+                    || label.chars().any(is_unsafe_remote_label_char)
+                    || label != source.label.as_deref().unwrap_or_default()
+                {
+                    diagnostics.push(format!(
+                        "{key}.label must be 1-64 visible characters; ignoring source"
+                    ));
+                    continue;
+                }
+            }
+
+            if let Err(err) = crate::session::validate_name(&source.session) {
+                diagnostics.push(format!("{key}.session is invalid: {err}; ignoring source"));
+                continue;
+            }
+
+            let identity = (source.target.clone(), source.session.clone());
+            if identities.contains(&identity) {
+                diagnostics.push(format!(
+                    "{key} duplicates target {:?} session {:?}; ignoring duplicate",
+                    source.target, source.session
+                ));
+                continue;
+            }
+            let fleet_label = source.fleet_label();
+            if fleet_labels.contains(&fleet_label) {
+                diagnostics.push(format!(
+                    "{key} has duplicate fleet label {fleet_label:?}; choose a unique label; ignoring duplicate"
+                ));
+                continue;
+            }
+            identities.insert(identity);
+            fleet_labels.insert(fleet_label);
+            valid.push(source.clone());
+        }
+
+        (valid, diagnostics)
+    }
+
+    pub(crate) fn agent_source_diagnostics(&self) -> Vec<String> {
+        self.validated_agent_sources().1
+    }
+}
+
+fn is_unsafe_remote_label_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            agent_sources: Vec::new(),
+            agent_source_indices: Vec::new(),
+            agent_source_count: 0,
+            agent_source_parse_diagnostics: Vec::new(),
         }
     }
 }
@@ -1818,5 +2010,146 @@ scrollback_lines = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    #[test]
+    fn remote_agent_sources_parse_with_safe_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[[remote.agent_sources]]
+target = "build-box"
+
+[[remote.agent_sources]]
+target = "user@gpu-box"
+label = "gpu"
+session = "work"
+"#,
+        )
+        .unwrap();
+
+        let (sources, diagnostics) = config.remote.validated_agent_sources();
+        assert!(diagnostics.is_empty());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].session, "default");
+        assert_eq!(sources[0].display_label(), "build-box");
+        assert_eq!(sources[1].display_label(), "gpu");
+        assert_eq!(sources[1].fleet_label(), "gpu/work");
+    }
+
+    #[test]
+    fn remote_agent_sources_reject_ambiguous_or_interactive_targets() {
+        let config: Config = toml::from_str(
+            r#"
+[[remote.agent_sources]]
+target = "-oProxyCommand=bad"
+
+[[remote.agent_sources]]
+target = "box"
+session = "work"
+
+[[remote.agent_sources]]
+target = "box"
+session = "work"
+
+[[remote.agent_sources]]
+target = "box\u202egood"
+"#,
+        )
+        .unwrap();
+
+        let (sources, diagnostics) = config.remote.validated_agent_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("leading '-'")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("duplicates")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("bidirectional formatting")));
+    }
+
+    #[test]
+    fn remote_agent_sources_isolate_structurally_invalid_entries() {
+        let config: Config = toml::from_str(
+            r#"
+[[remote.agent_sources]]
+label = "missing target"
+
+[[remote.agent_sources]]
+target = "wrong-label-type"
+label = 7
+
+[[remote.agent_sources]]
+target = "wrong-session-type"
+session = ["work"]
+
+[[remote.agent_sources]]
+target = "healthy-box"
+label = "healthy"
+"#,
+        )
+        .unwrap();
+
+        let (sources, diagnostics) = config.remote.validated_agent_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].target, "healthy-box");
+        assert_eq!(diagnostics.len(), 3);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.contains("invalid remote.agent_sources")
+                && diagnostic.contains("ignoring source")
+        }));
+    }
+
+    #[test]
+    fn remote_agent_sources_enforce_limits_and_unambiguous_labels() {
+        let mut toml = String::new();
+        for index in 0..33 {
+            toml.push_str(&format!(
+                "[[remote.agent_sources]]\ntarget = \"box-{index}\"\n\n"
+            ));
+        }
+        let config: Config = toml::from_str(&toml).unwrap();
+        let (sources, diagnostics) = config.remote.validated_agent_sources();
+        assert_eq!(sources.len(), 32);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("at most 32")));
+
+        let config: Config = toml::from_str(
+            r#"
+[[remote.agent_sources]]
+target = "first"
+label = "gpu"
+session = "work"
+
+[[remote.agent_sources]]
+target = "second"
+label = "gpu/work"
+
+[[remote.agent_sources]]
+target = "third"
+label = "unsafe\u202elabel"
+
+[[remote.agent_sources]]
+target = "fourth"
+session = "bad/name"
+"#,
+        )
+        .unwrap();
+        let (sources, diagnostics) = config.remote.validated_agent_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].target, "first");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("duplicate fleet label")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("visible characters")));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("session is invalid")));
     }
 }

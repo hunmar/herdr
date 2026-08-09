@@ -342,6 +342,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
 
     diagnostics.extend(config.theme.diagnostics());
+    diagnostics.extend(config.remote.agent_source_diagnostics());
 
     Ok(LoadedConfig {
         config,
@@ -863,6 +864,77 @@ resume_agents_on_restore = true
         assert!(loaded.config.session.resume_agents_on_restore);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn live_config_keeps_valid_remote_sources_beside_malformed_entries() {
+        let loaded = load_live_config_from_str(
+            r#"
+[remote]
+manage_ssh_config = false
+
+[[remote.agent_sources]]
+label = "missing target"
+
+[[remote.agent_sources]]
+target = "healthy-box"
+session = "work"
+"#,
+        )
+        .unwrap();
+
+        let (sources, _) = loaded.config.remote.validated_agent_sources();
+        assert!(!loaded.config.remote.manage_ssh_config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].target, "healthy-box");
+        assert!(loaded.invalid_sections.is_empty());
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("missing field `target`")));
+    }
+
+    #[test]
+    fn startup_config_keeps_valid_remote_sources_beside_malformed_entries() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-remote-agent-sources-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+manage_ssh_config = false
+
+[[remote.agent_sources]]
+target = "wrong-label-type"
+label = 7
+
+[[remote.agent_sources]]
+target = "healthy-box"
+"#,
+        )
+        .unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let loaded = Config::load();
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+
+        let (sources, _) = loaded.config.remote.validated_agent_sources();
+        assert!(!loaded.config.remote.manage_ssh_config);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].target, "healthy-box");
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("invalid remote.agent_sources[0]")));
+        assert!(!loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("using defaults")));
     }
 
     #[test]

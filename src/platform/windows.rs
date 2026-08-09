@@ -50,7 +50,7 @@ use windows_sys::{
                 GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
                 QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW, DETACHED_PROCESS,
                 PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
             },
         },
         UI::{
@@ -1300,11 +1300,13 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 
     for &pid in pids {
-        let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        let Some(process) =
+            ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE)
+        else {
             continue;
         };
-        unsafe {
-            TerminateProcess(process.0, 1);
+        if unsafe { TerminateProcess(process.0, 1) } == 0 {
+            tracing::debug!(pid, "failed to terminate process during tree shutdown");
         }
     }
 }

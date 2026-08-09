@@ -250,9 +250,9 @@ impl App {
                 }
             }
             NavigateAction::FocusAgent(idx) => {
-                if let Some((ws_idx, pane_id)) = self.agent_entry_target(idx) {
+                if let Some((visual_idx, ws_idx, pane_id)) = self.agent_entry_target(idx) {
                     self.focus_pane_internal_via_api(ws_idx, pane_id);
-                    self.state.ensure_agent_panel_entry_visible(idx);
+                    self.state.ensure_agent_panel_entry_visible(visual_idx);
                     leave_navigate_mode(&mut self.state);
                 }
             }
@@ -733,10 +733,17 @@ impl App {
         Some((ws.active_tab as isize + delta).rem_euclid(ws.tabs.len() as isize) as usize)
     }
 
-    fn agent_entry_target(&self, idx: usize) -> Option<(usize, crate::layout::PaneId)> {
+    fn agent_entry_target(&self, idx: usize) -> Option<(usize, usize, crate::layout::PaneId)> {
         let entries = crate::ui::agent_panel_entries(&self.state);
-        let target = entries.get(idx)?;
-        Some((target.ws_idx, target.pane_id))
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(visual_idx, entry)| {
+                entry
+                    .local_target()
+                    .map(|(ws_idx, _, pane_id)| (visual_idx, ws_idx, pane_id))
+            })
+            .nth(idx)
     }
 
     fn relative_agent_entry(&self, forward: bool) -> Option<(usize, usize, crate::layout::PaneId)> {
@@ -744,23 +751,36 @@ impl App {
         if entries.is_empty() {
             return None;
         }
-        let focused = self
-            .state
-            .active
-            .and_then(|idx| self.state.workspaces.get(idx))
-            .and_then(crate::workspace::Workspace::focused_pane_id);
-        let current_idx = entries
+        let focused = self.state.active.and_then(|ws_idx| {
+            self.state
+                .workspaces
+                .get(ws_idx)
+                .and_then(crate::workspace::Workspace::focused_pane_id)
+                .map(|pane_id| (ws_idx, pane_id))
+        });
+        let local_entries = entries
             .iter()
-            .position(|entry| Some(entry.pane_id) == focused);
+            .enumerate()
+            .filter_map(|(visual_idx, entry)| {
+                entry
+                    .local_target()
+                    .map(|(ws_idx, _, pane_id)| (visual_idx, ws_idx, pane_id))
+            })
+            .collect::<Vec<_>>();
+        if local_entries.is_empty() {
+            return None;
+        }
+        let current_idx = local_entries
+            .iter()
+            .position(|(_, ws_idx, pane_id)| Some((*ws_idx, *pane_id)) == focused);
         let next_idx = match (current_idx, forward) {
-            (Some(idx), true) => (idx + 1) % entries.len(),
-            (Some(0), false) => entries.len() - 1,
+            (Some(idx), true) => (idx + 1) % local_entries.len(),
+            (Some(0), false) => local_entries.len() - 1,
             (Some(idx), false) => idx - 1,
             (None, true) => 0,
-            (None, false) => entries.len() - 1,
+            (None, false) => local_entries.len() - 1,
         };
-        let target = entries.get(next_idx)?;
-        Some((next_idx, target.ws_idx, target.pane_id))
+        local_entries.get(next_idx).copied()
     }
 
     fn pass_through_key_to_focused_pane(&mut self, key: TerminalKey) -> bool {
@@ -1662,12 +1682,14 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::PreviousAgent => {
-            state.previous_agent();
-            leave_navigate_mode(state);
+            if state.previous_agent() {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::NextAgent => {
-            state.next_agent();
-            leave_navigate_mode(state);
+            if state.next_agent() {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::NewTab => {
             if state.active.is_some() {
@@ -1936,6 +1958,65 @@ mod tests {
         app
     }
 
+    fn add_remote_agent(state: &mut AppState, status: crate::detect::AgentState) {
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        let host = crate::remote_agents::RemoteHostKey::for_source(&source);
+        state
+            .remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: host.clone(),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+        state.remote_agents.apply_update(
+            crate::remote_agents::RemoteAgentUpdate::immediate(
+                host,
+                1,
+                crate::remote_agents::RemoteAgentUpdateKind::Snapshot(
+                    crate::remote_agents::RemoteAgentSnapshot {
+                        version: "0.8.0".into(),
+                        protocol: crate::protocol::PROTOCOL_VERSION,
+                        agents: vec![crate::remote_agents::RemoteAgentPresentation {
+                            workspace_id: "w1".into(),
+                            tab_id: "w1:t1".into(),
+                            pane_id: "w1:p1".into(),
+                            workspace_label: "remote".into(),
+                            tab_label: None,
+                            pane_label: None,
+                            terminal_title: None,
+                            terminal_title_stripped: None,
+                            agent_label: "claude".into(),
+                            agent_kind_label: Some("claude".into()),
+                            agent: Some(crate::detect::Agent::Claude),
+                            state: status,
+                            seen: true,
+                            state_labels: std::collections::HashMap::new(),
+                            tokens: std::collections::HashMap::new(),
+                            display_order: (0, 0, 0),
+                            order: (0, 1, 1),
+                        }],
+                    },
+                ),
+            ),
+            &mut state.next_agent_state_change_seq,
+        );
+    }
+
+    fn mark_local_agent(state: &mut AppState, ws_idx: usize, status: crate::detect::AgentState) {
+        let pane_id = state.workspaces[ws_idx].tabs[0].root_pane;
+        let terminal_id = state.workspaces[ws_idx].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal.state = status;
+    }
+
     #[test]
     fn next_agent_starts_at_first_visible_entry_when_focused_agent_is_filtered_out() {
         let mut app = app_with_test_workspaces(&["hidden", "first", "second"]);
@@ -1967,6 +2048,53 @@ mod tests {
         app.execute_tui_navigate_action(NavigateAction::NextAgent, ActionContext::Prefix);
 
         assert_eq!(app.state.active, Some(1));
+    }
+
+    #[test]
+    fn indexed_and_relative_agent_navigation_skip_interleaved_remote_rows() {
+        let mut app = app_with_test_workspaces(&["first", "second"]);
+        mark_local_agent(&mut app.state, 0, crate::detect::AgentState::Blocked);
+        mark_local_agent(&mut app.state, 1, crate::detect::AgentState::Idle);
+        add_remote_agent(&mut app.state, crate::detect::AgentState::Working);
+        app.state.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
+
+        let entries = crate::ui::agent_panel_entries(&app.state);
+        assert!(entries[0].local_target().is_some());
+        assert!(matches!(
+            entries[1].target,
+            crate::ui::AgentPanelTarget::Remote { .. }
+        ));
+        assert!(entries[2].local_target().is_some());
+
+        app.execute_tui_navigate_action(NavigateAction::FocusAgent(1), ActionContext::Prefix);
+        assert_eq!(app.state.active, Some(1));
+
+        app.state.switch_workspace(0);
+        app.execute_tui_navigate_action(NavigateAction::NextAgent, ActionContext::Prefix);
+        assert_eq!(app.state.active, Some(1));
+        app.execute_tui_navigate_action(NavigateAction::PreviousAgent, ActionContext::Prefix);
+        assert_eq!(app.state.active, Some(0));
+    }
+
+    #[test]
+    fn agent_navigation_is_a_full_noop_when_only_remote_rows_exist() {
+        let mut app = app_with_test_workspaces(&[]);
+        add_remote_agent(&mut app.state, crate::detect::AgentState::Working);
+        app.state.mode = Mode::Navigate;
+
+        for action in [
+            NavigateAction::FocusAgent(0),
+            NavigateAction::NextAgent,
+            NavigateAction::PreviousAgent,
+        ] {
+            app.execute_tui_navigate_action(action, ActionContext::Navigate);
+            assert_eq!(app.state.active, None);
+            assert_eq!(app.state.mode, Mode::Navigate);
+        }
+
+        execute_navigate_action(&mut app.state, NavigateAction::NextAgent);
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.mode, Mode::Navigate);
     }
 
     #[test]

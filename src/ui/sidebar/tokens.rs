@@ -159,9 +159,15 @@ mod tests {
 
     fn entry() -> AgentPanelEntry {
         AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: crate::layout::PaneId::from_raw(1),
+            target: super::super::AgentPanelTarget::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId::from_raw(1),
+            },
+            view_workspace_id: "w1".into(),
+            view_tab_id: "w1:t1".into(),
+            view_pane_id: "w1:p1".into(),
+            order: (0, 0, 0, 0),
             primary_label: "repo".into(),
             primary_tab_label: None,
             pane_label: None,

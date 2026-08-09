@@ -528,11 +528,15 @@ impl AppState {
                             return Some(MouseAction::FocusWorkspace { ws_idx: idx });
                         }
 
-                        if let Some((ws_idx, _tab_idx, pane_id)) =
-                            self.collapsed_agent_detail_target_at(mouse.row)
-                        {
-                            self.mode = Mode::Terminal;
-                            return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                        if let Some(target) = self.collapsed_agent_detail_target_at(mouse.row) {
+                            if let crate::ui::AgentPanelTarget::Local {
+                                ws_idx, pane_id, ..
+                            } = target
+                            {
+                                self.mode = Mode::Terminal;
+                                return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                            }
+                            return None;
                         }
                         return None;
                     }
@@ -619,11 +623,15 @@ impl AppState {
                         return None;
                     }
 
-                    if let Some((ws_idx, _tab_idx, pane_id)) =
-                        self.agent_detail_target_at(mouse.row)
-                    {
-                        self.mode = Mode::Terminal;
-                        return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                    if let Some(target) = self.agent_detail_target_at(mouse.row) {
+                        if let crate::ui::AgentPanelTarget::Local {
+                            ws_idx, pane_id, ..
+                        } = target
+                        {
+                            self.mode = Mode::Terminal;
+                            return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                        }
+                        return None;
                     }
                 } else if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
                     if self.mode != Mode::Terminal {
@@ -1188,13 +1196,15 @@ impl AppState {
                 self.mode = Mode::Terminal;
                 return MobileMouseResult::Action(MouseAction::FocusTab { tab_idx });
             }
-            Some(crate::ui::MobileSwitcherTarget::Agent {
-                ws_idx,
-                tab_idx: _,
-                pane_id,
-            }) => {
-                self.mode = Mode::Terminal;
-                return MobileMouseResult::Action(MouseAction::FocusPane { ws_idx, pane_id });
+            Some(crate::ui::MobileSwitcherTarget::Agent(target)) => {
+                if let crate::ui::AgentPanelTarget::Local {
+                    ws_idx, pane_id, ..
+                } = target
+                {
+                    self.mode = Mode::Terminal;
+                    return MobileMouseResult::Action(MouseAction::FocusPane { ws_idx, pane_id });
+                }
+                return MobileMouseResult::Consumed;
             }
             Some(crate::ui::MobileSwitcherTarget::Menu(action_idx)) => {
                 let actions = global_menu_actions(self);
@@ -1935,6 +1945,55 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    fn add_remote_agent(state: &mut crate::app::state::AppState) {
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        let host = crate::remote_agents::RemoteHostKey::for_source(&source);
+        state
+            .remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: host.clone(),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+        state.remote_agents.apply_update(
+            crate::remote_agents::RemoteAgentUpdate::immediate(
+                host,
+                1,
+                crate::remote_agents::RemoteAgentUpdateKind::Snapshot(
+                    crate::remote_agents::RemoteAgentSnapshot {
+                        version: "0.8.0".into(),
+                        protocol: crate::protocol::PROTOCOL_VERSION,
+                        agents: vec![crate::remote_agents::RemoteAgentPresentation {
+                            workspace_id: "w1".into(),
+                            tab_id: "w1:t1".into(),
+                            pane_id: "w1:p1".into(),
+                            workspace_label: "remote".into(),
+                            tab_label: None,
+                            pane_label: None,
+                            terminal_title: None,
+                            terminal_title_stripped: None,
+                            agent_label: "claude".into(),
+                            agent_kind_label: Some("claude".into()),
+                            agent: Some(Agent::Claude),
+                            state: AgentState::Working,
+                            seen: true,
+                            state_labels: std::collections::HashMap::new(),
+                            tokens: std::collections::HashMap::new(),
+                            display_order: (0, 0, 0),
+                            order: (0, 1, 1),
+                        }],
+                    },
+                ),
+            ),
+            &mut state.next_agent_state_change_seq,
+        );
     }
 
     #[tokio::test]
@@ -3927,6 +3986,28 @@ mod tests {
 
         assert_eq!(app.state.active, Some(1));
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn mobile_remote_agent_tap_is_consumed_without_changing_focus_or_mode() {
+        let mut app = app_for_mouse_test();
+        add_remote_agent(&mut app.state);
+        app.state.workspaces.clear();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
+        assert_eq!(app.state.view.layout, ViewLayout::Mobile);
+        let viewport = crate::ui::mobile_switcher_areas(&app.state).viewport;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            viewport.x + 2,
+            viewport.y + 1,
+        ));
+
+        assert_eq!(app.state.active, None);
+        assert_eq!(app.state.mode, Mode::Navigate);
     }
 
     #[test]

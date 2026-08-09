@@ -333,7 +333,7 @@ impl AppState {
     pub(super) fn collapsed_agent_detail_target_at(
         &self,
         row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
+    ) -> Option<crate::ui::AgentPanelTarget> {
         if !self.sidebar_collapsed {
             return None;
         }
@@ -355,7 +355,7 @@ impl AppState {
         let detail_idx = (row - detail_content_area.y) as usize;
         let details = crate::ui::agent_panel_entries(self);
         let detail = details.get(detail_idx)?;
-        Some((detail.ws_idx, detail.tab_idx, detail.pane_id))
+        Some(detail.target.clone())
     }
 
     pub(super) fn workspace_drop_target_at_row(
@@ -482,10 +482,7 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
-    pub(super) fn agent_detail_target_at(
-        &self,
-        row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
+    pub(super) fn agent_detail_target_at(&self, row: u16) -> Option<crate::ui::AgentPanelTarget> {
         if self.sidebar_collapsed {
             return None;
         }
@@ -510,7 +507,7 @@ impl AppState {
                 break;
             }
             if row >= row_y && row < row_y.saturating_add(height) {
-                return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
+                return Some(detail.target.clone());
             }
             row_y = row_y
                 .saturating_add(height)
@@ -530,11 +527,60 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelSort, DragTarget, Mode},
+        app::state::{AgentPanelSort, AppState, DragTarget, Mode},
         config::SidebarCollapsedModeConfig,
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    fn add_remote_agent(state: &mut AppState) {
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        let host = crate::remote_agents::RemoteHostKey::for_source(&source);
+        state
+            .remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: host.clone(),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+        state.remote_agents.apply_update(
+            crate::remote_agents::RemoteAgentUpdate::immediate(
+                host,
+                1,
+                crate::remote_agents::RemoteAgentUpdateKind::Snapshot(
+                    crate::remote_agents::RemoteAgentSnapshot {
+                        version: "0.8.0".into(),
+                        protocol: 20,
+                        agents: vec![crate::remote_agents::RemoteAgentPresentation {
+                            workspace_id: "w1".into(),
+                            tab_id: "t1".into(),
+                            pane_id: "p1".into(),
+                            workspace_label: "repo".into(),
+                            tab_label: None,
+                            pane_label: None,
+                            terminal_title: None,
+                            terminal_title_stripped: None,
+                            agent_label: "claude".into(),
+                            agent_kind_label: Some("claude".into()),
+                            agent: Some(Agent::Claude),
+                            state: AgentState::Working,
+                            seen: true,
+                            state_labels: std::collections::HashMap::new(),
+                            tokens: std::collections::HashMap::new(),
+                            display_order: (0, 0, 0),
+                            order: (0, 0, 0),
+                        }],
+                    },
+                ),
+            ),
+            &mut state.next_agent_state_change_seq,
+        );
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {
@@ -784,19 +830,78 @@ mod tests {
 
         assert_eq!(
             app.state.agent_detail_target_at(body.y),
-            Some((0, 0, first_pane))
+            Some(crate::ui::AgentPanelTarget::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: first_pane,
+            })
         );
         assert_eq!(app.state.agent_detail_target_at(body.y + 1), None);
         assert_eq!(
             app.state.agent_detail_target_at(body.y + 3),
-            Some((1, 0, second_pane))
+            Some(crate::ui::AgentPanelTarget::Local {
+                ws_idx: 1,
+                tab_idx: 0,
+                pane_id: second_pane,
+            })
         );
 
         app.state.sidebar_agents.row_gap = 0;
         assert_eq!(
             app.state.agent_detail_target_at(body.y + 1),
-            Some((1, 0, second_pane))
+            Some(crate::ui::AgentPanelTarget::Local {
+                ws_idx: 1,
+                tab_idx: 0,
+                pane_id: second_pane,
+            })
         );
+    }
+
+    #[test]
+    fn remote_agent_row_is_consumed_without_focusing_a_local_pane() {
+        let mut app = app_for_mouse_test();
+        add_remote_agent(&mut app.state);
+        app.state.mode = Mode::Navigate;
+        let detail_area = app.state.agent_panel_rect();
+        let body = crate::ui::agent_panel_body_rect(detail_area, false);
+
+        assert!(matches!(
+            app.state.agent_detail_target_at(body.y),
+            Some(crate::ui::AgentPanelTarget::Remote { .. })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x,
+            body.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.state.active, None);
+    }
+
+    #[test]
+    fn collapsed_remote_agent_row_is_consumed_without_changing_mode() {
+        let mut app = app_for_mouse_test();
+        add_remote_agent(&mut app.state);
+        app.state.mode = Mode::Navigate;
+        app.state.sidebar_collapsed = true;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
+        app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
+        let (_, _, detail_area) =
+            crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
+
+        assert!(matches!(
+            app.state.collapsed_agent_detail_target_at(detail_area.y),
+            Some(crate::ui::AgentPanelTarget::Remote { .. })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            detail_area.x,
+            detail_area.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.state.active, None);
     }
 
     #[test]
@@ -839,7 +944,11 @@ mod tests {
 
         assert_eq!(
             app.state.agent_detail_target_at(body.y),
-            Some((0, 0, first_pane))
+            Some(crate::ui::AgentPanelTarget::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: first_pane,
+            })
         );
     }
 
