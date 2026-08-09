@@ -1084,6 +1084,24 @@
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.agent_sources.target",
+          "type": "string",
+          "default": "required",
+          "description": "OpenSSH config alias or user@host for a read-only remote agent source."
+        },
+        {
+          "key": "remote.agent_sources.label",
+          "type": "string",
+          "default": "target",
+          "description": "Optional machine label shown in the Agents sidebar."
+        },
+        {
+          "key": "remote.agent_sources.session",
+          "type": "string",
+          "default": "\"default\"",
+          "description": "Running remote Herdr session to observe."
         }
       ]
     },

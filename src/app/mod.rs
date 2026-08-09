@@ -103,6 +103,7 @@ pub struct App {
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
+    remote_agent_supervisor: crate::remote_agents::RemoteAgentSupervisor,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
@@ -527,6 +528,7 @@ impl App {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
+            remote_agents: crate::remote_agents::RemoteAgentRegistry::default(),
             active,
             previous_pane_focus: None,
             selected,
@@ -691,6 +693,12 @@ impl App {
 
         state.terminals = restored_terminals;
 
+        let mut remote_agent_supervisor = crate::remote_agents::RemoteAgentSupervisor::default();
+        let (remote_sources, _) = config.remote.validated_agent_sources();
+        let remote_registrations =
+            remote_agent_supervisor.reconcile(remote_sources, event_tx.clone());
+        state.remote_agents.reconcile(&remote_registrations);
+
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
                 .resolved_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
@@ -736,6 +744,7 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
+            remote_agent_supervisor,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
@@ -1502,6 +1511,14 @@ impl App {
 
         if !invalid_section("advanced") {
             self.state.pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes;
+        }
+
+        if !invalid_section("remote") {
+            let (sources, _) = config.remote.validated_agent_sources();
+            let registrations = self
+                .remote_agent_supervisor
+                .reconcile(sources, self.event_tx.clone());
+            self.state.remote_agents.reconcile(&registrations);
         }
 
         if !invalid_section("update") {

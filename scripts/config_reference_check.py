@@ -10,8 +10,8 @@ The comparison checks key names and serde-derived enum values, so failures
 name exact missing, stale, duplicated, or value-drifted entries.
 
 Open-ended surfaces (arrays of tables such as [[keys.command]]) are not
-enumerable per-key and are skipped; they are listed in SKIPPED_SUBTREES so
-the skip stays explicit.
+enumerable per-key and are skipped. Fixed-shape arrays of tables are walked
+so their element fields remain covered by the reference check.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ ROOT_STRUCT = "Config"
 # Dotted key prefixes that are open-ended (user-defined tables/arrays) and
 # therefore not enumerable in a flat reference table.
 SKIPPED_SUBTREES = ("keys.command",)
+FIXED_ARRAY_SUBTREES = ("remote.agent_sources",)
 
 FIELD_RE = re.compile(r"^\s*pub ([a-z_][a-z0-9_]*):\s*(.+?),?\s*$")
 STRUCT_RE = re.compile(r"^\s*pub(?:\(crate\))? struct ([A-Za-z0-9_]+)\s*\{\s*$")
@@ -233,10 +234,11 @@ def collect_entries(model: Model, struct_name: str = ROOT_STRUCT, prefix: str = 
             if dotted in SKIPPED_SUBTREES:
                 continue
             if is_vec:
-                raise ValueError(
-                    f"{dotted} is an open-ended array of tables; add it to "
-                    "SKIPPED_SUBTREES and document it in prose"
-                )
+                if dotted not in FIXED_ARRAY_SUBTREES:
+                    raise ValueError(
+                        f"{dotted} is an array of tables; add it to either "
+                        "SKIPPED_SUBTREES or FIXED_ARRAY_SUBTREES"
+                    )
             entries.extend(collect_entries(model, inner, f"{dotted}."))
         else:
             entry = {"key": dotted, "rust_type": struct_field.rust_type, "doc": struct_field.doc}

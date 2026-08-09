@@ -21,6 +21,7 @@ enum EvalValue {
     String(String),
     Bool(bool),
     Number(u64),
+    Order([usize; 4]),
 }
 
 pub(crate) fn validate_agent_view(spec: &mut AgentViewSetParams) -> Result<(), String> {
@@ -303,7 +304,7 @@ fn field_value(
 }
 
 fn builtin_field_value(
-    app: &AppState,
+    _app: &AppState,
     entry: &AgentPanelEntry,
     field: AgentViewBuiltinField,
 ) -> Option<EvalValue> {
@@ -311,12 +312,11 @@ fn builtin_field_value(
         AgentViewBuiltinField::Status => {
             Some(EvalValue::String(status_name(entry.state, entry.seen)))
         }
-        AgentViewBuiltinField::WorkspaceId => app
-            .workspaces
-            .get(entry.ws_idx)
-            .map(|workspace| EvalValue::String(workspace.id.clone())),
-        AgentViewBuiltinField::TabId => public_tab_id(app, entry).map(EvalValue::String),
-        AgentViewBuiltinField::PaneId => public_pane_id(app, entry).map(EvalValue::String),
+        AgentViewBuiltinField::WorkspaceId => {
+            Some(EvalValue::String(entry.view_workspace_id.clone()))
+        }
+        AgentViewBuiltinField::TabId => Some(EvalValue::String(entry.view_tab_id.clone())),
+        AgentViewBuiltinField::PaneId => Some(EvalValue::String(entry.view_pane_id.clone())),
         AgentViewBuiltinField::Agent => entry.agent_kind_label.clone().map(EvalValue::String),
         AgentViewBuiltinField::Seen => Some(EvalValue::Bool(entry.seen)),
         AgentViewBuiltinField::StateChangeSeq => {
@@ -349,7 +349,7 @@ fn context_value(app: &AppState, context: AgentViewContext) -> Option<EvalValue>
 }
 
 fn sort_value(
-    app: &AppState,
+    _app: &AppState,
     entry: &AgentPanelEntry,
     field: &AgentViewSortField,
 ) -> Option<EvalValue> {
@@ -359,18 +359,10 @@ fn sort_value(
         }
         AgentViewSortField::Builtin(field) => match field {
             AgentViewBuiltinSortField::WorkspaceOrder => {
-                Some(EvalValue::Number(entry.ws_idx as u64))
+                Some(EvalValue::Order([entry.order.0, entry.order.1, 0, 0]))
             }
-            AgentViewBuiltinSortField::TabOrder => app
-                .workspaces
-                .get(entry.ws_idx)
-                .and_then(|workspace| workspace.public_tab_number(entry.tab_idx))
-                .map(|number| EvalValue::Number(number as u64)),
-            AgentViewBuiltinSortField::PaneOrder => app
-                .workspaces
-                .get(entry.ws_idx)
-                .and_then(|workspace| workspace.public_pane_number(entry.pane_id))
-                .map(|number| EvalValue::Number(number as u64)),
+            AgentViewBuiltinSortField::TabOrder => Some(EvalValue::Number(entry.order.2 as u64)),
+            AgentViewBuiltinSortField::PaneOrder => Some(EvalValue::Number(entry.order.3 as u64)),
             AgentViewBuiltinSortField::Attention => Some(EvalValue::Number(u64::from(
                 super::api_helpers::tab_attention_priority(entry.state, entry.seen),
             ))),
@@ -404,24 +396,6 @@ fn status_name(state: crate::detect::AgentState, seen: bool) -> String {
         AgentStatus::Unknown => "unknown",
     }
     .to_string()
-}
-
-fn public_tab_id(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
-    let workspace = app.workspaces.get(entry.ws_idx)?;
-    let number = workspace.public_tab_number(entry.tab_idx)?;
-    Some(crate::workspace::public_tab_id_for_number(
-        &workspace.id,
-        number,
-    ))
-}
-
-fn public_pane_id(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
-    let workspace = app.workspaces.get(entry.ws_idx)?;
-    let number = workspace.public_pane_number(entry.pane_id)?;
-    Some(crate::workspace::public_pane_id_for_number(
-        &workspace.id,
-        number,
-    ))
 }
 
 #[cfg(test)]
@@ -463,23 +437,152 @@ mod tests {
         }
     }
 
+    fn panel_entry(order: (usize, usize, usize, usize)) -> AgentPanelEntry {
+        AgentPanelEntry {
+            target: crate::ui::AgentPanelTarget::Remote {
+                source: format!("source:{}", order.0),
+                pane_id: format!("pane:{}", order.3),
+            },
+            view_workspace_id: String::new(),
+            view_tab_id: String::new(),
+            view_pane_id: String::new(),
+            order,
+            primary_label: String::new(),
+            primary_tab_label: None,
+            pane_label: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_label: None,
+            agent_kind_label: None,
+            agent: None,
+            state: AgentState::Unknown,
+            seen: true,
+            last_agent_state_change_seq: None,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
+        }
+    }
+
     #[test]
     fn current_workspace_filter_tracks_presented_workspace() {
         let mut state = state_with_agents();
         state.agent_view_override = Some(current_workspace_view());
 
-        assert_eq!(crate::ui::agent_panel_entries(&state)[0].ws_idx, 0);
+        assert_eq!(
+            crate::ui::agent_panel_entries(&state)[0]
+                .local_target()
+                .unwrap()
+                .0,
+            0
+        );
 
         state.mode = Mode::Navigate;
         state.selected = 1;
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].ws_idx, 1);
+        assert_eq!(entries[0].local_target().unwrap().0, 1);
 
         state.mode = Mode::Settings;
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].ws_idx, 0);
+        assert_eq!(entries[0].local_target().unwrap().0, 0);
+    }
+
+    #[test]
+    fn current_workspace_filter_does_not_match_same_raw_id_on_remote_host() {
+        let mut state = state_with_agents();
+        let local_workspace_id = state.workspaces[0].id.clone();
+        let source = crate::config::RemoteAgentSourceConfig {
+            target: "box".into(),
+            label: None,
+            session: "default".into(),
+        };
+        let host = crate::remote_agents::RemoteHostKey::for_source(&source);
+        state
+            .remote_agents
+            .reconcile(&[crate::remote_agents::RemoteHostRegistration {
+                key: host.clone(),
+                label: "box".into(),
+                generation: 1,
+                order: 0,
+            }]);
+        state.remote_agents.apply_update(
+            crate::remote_agents::RemoteAgentUpdate::immediate(
+                host.clone(),
+                1,
+                crate::remote_agents::RemoteAgentUpdateKind::Snapshot(
+                    crate::remote_agents::RemoteAgentSnapshot {
+                        version: "0.8.0".into(),
+                        protocol: 20,
+                        agents: vec![crate::remote_agents::RemoteAgentPresentation {
+                            workspace_id: local_workspace_id.clone(),
+                            tab_id: "t1".into(),
+                            pane_id: "p1".into(),
+                            workspace_label: "remote repo".into(),
+                            tab_label: None,
+                            pane_label: None,
+                            terminal_title: None,
+                            terminal_title_stripped: None,
+                            agent_label: "claude".into(),
+                            agent_kind_label: Some("claude".into()),
+                            agent: Some(Agent::Claude),
+                            state: AgentState::Working,
+                            seen: true,
+                            state_labels: std::collections::HashMap::new(),
+                            tokens: std::collections::HashMap::from([
+                                ("machine".into(), "user-machine".into()),
+                                ("connection".into(), "user-connection".into()),
+                            ]),
+                            display_order: (0, 0, 0),
+                            order: (0, 0, 0),
+                        }],
+                    },
+                ),
+            ),
+            &mut state.next_agent_state_change_seq,
+        );
+
+        let unfiltered = crate::ui::agent_panel_entries(&state);
+        let remote = unfiltered
+            .iter()
+            .find(|entry| matches!(entry.target, crate::ui::AgentPanelTarget::Remote { .. }))
+            .unwrap();
+        assert_ne!(remote.view_workspace_id, local_workspace_id);
+        assert_eq!(
+            remote.tokens.get("machine").map(String::as_str),
+            Some("user-machine")
+        );
+        assert_eq!(
+            remote.tokens.get("connection").map(String::as_str),
+            Some("user-connection")
+        );
+
+        assert!(state.remote_agents.apply_update(
+            crate::remote_agents::RemoteAgentUpdate::immediate(
+                host,
+                1,
+                crate::remote_agents::RemoteAgentUpdateKind::Offline {
+                    error: "network down".into(),
+                },
+            ),
+            &mut state.next_agent_state_change_seq,
+        ));
+        let offline = crate::ui::agent_panel_entries(&state)
+            .into_iter()
+            .find(|entry| matches!(entry.target, crate::ui::AgentPanelTarget::Remote { .. }))
+            .unwrap();
+        assert_eq!(offline.state, AgentState::Unknown);
+        assert!(offline.seen);
+        assert!(offline.primary_label.contains("(offline)"));
+        assert_eq!(
+            offline.state_labels.get("unknown").map(String::as_str),
+            Some("offline")
+        );
+
+        state.agent_view_override = Some(current_workspace_view());
+        let filtered = crate::ui::agent_panel_entries(&state);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].local_target().is_some());
     }
 
     #[test]
@@ -515,8 +618,75 @@ mod tests {
 
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].ws_idx, 1);
-        assert_eq!(entries[1].ws_idx, 0);
+        assert_eq!(entries[0].local_target().unwrap().0, 1);
+        assert_eq!(entries[1].local_target().unwrap().0, 0);
+    }
+
+    #[test]
+    fn workspace_order_keeps_source_order_before_remote_workspace_number() {
+        let first_source = panel_entry((1, 99, 0, 0));
+        let second_source = panel_entry((2, 0, 0, 0));
+        let sort = AgentViewSort {
+            field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
+            order: AgentViewSortOrder::Asc,
+        };
+
+        assert_eq!(
+            compare_entries(
+                &AppState::test_new(),
+                &first_source,
+                &second_source,
+                &[sort]
+            ),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn tab_and_pane_order_remain_scalar_custom_sort_fields() {
+        let tab_two_in_first_workspace = panel_entry((0, 0, 2, 9));
+        let tab_one_in_second_workspace = panel_entry((0, 1, 1, 8));
+        let tab_sort = AgentViewSort {
+            field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::TabOrder),
+            order: AgentViewSortOrder::Asc,
+        };
+        assert_eq!(
+            compare_entries(
+                &AppState::test_new(),
+                &tab_two_in_first_workspace,
+                &tab_one_in_second_workspace,
+                std::slice::from_ref(&tab_sort),
+            ),
+            Ordering::Greater
+        );
+
+        let workspace_sort = AgentViewSort {
+            field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
+            order: AgentViewSortOrder::Desc,
+        };
+        assert_eq!(
+            compare_entries(
+                &AppState::test_new(),
+                &panel_entry((0, 0, 1, 2)),
+                &panel_entry((0, 1, 1, 1)),
+                &[tab_sort, workspace_sort],
+            ),
+            Ordering::Greater
+        );
+
+        let pane_sort = AgentViewSort {
+            field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::PaneOrder),
+            order: AgentViewSortOrder::Asc,
+        };
+        assert_eq!(
+            compare_entries(
+                &AppState::test_new(),
+                &panel_entry((0, 0, 1, 2)),
+                &panel_entry((0, 9, 9, 1)),
+                &[pane_sort],
+            ),
+            Ordering::Greater
+        );
     }
 
     #[test]

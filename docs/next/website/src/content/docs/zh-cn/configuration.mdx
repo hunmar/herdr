@@ -107,6 +107,19 @@ manage_ssh_config = true
 
 启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含用户和系统 SSH 配置，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Linux 和 macOS 客户端还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接；Windows OpenSSH 不使用此复用方式。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
 
+要在本地 Agents 侧栏中显示另一台机器上正在运行的 Herdr 会话中的代理，请添加只读来源：
+
+```toml
+[[remote.agent_sources]]
+target = "devbox"       # OpenSSH 配置别名或 user@host
+label = "devbox"        # 可选；默认使用 target
+session = "default"
+```
+
+Herdr 会为每个来源保持一个非交互式 SSH 观察连接，并每两秒读取一次远程会话快照。最多可配置 32 个来源。远程机器必须运行 Linux 或 macOS，在 `PATH` 或标准安装位置中提供协议兼容的 Herdr，并且所选会话已经启动。请先通过普通的 `ssh devbox` 或 `herdr --remote devbox` 连接，以接受主机密钥并配置身份验证；后台观察连接绝不会提示输入密码或批准主机密钥。首个版本中的远程行仅供查看。连接中断后，最近一次看到的行会保留并标记为离线；本地代理快捷键仍只会定位本地窗格。
+
+命名会话显示为 `<label>/<session>`，因此同一台机器上的多个会话仍可区分。整个机器列表中的显示标签必须唯一。
+
 ## 按键绑定
 
 有关前缀键的引导式介绍和经过验证的免前缀配置，请参阅[键盘](/docs/keyboard/)。

@@ -64,6 +64,10 @@ impl App {
                 results,
                 cache_updates,
             } => self.handle_git_status_refreshed(results, cache_updates),
+            AppEvent::RemoteAgentsUpdated(update) => self
+                .state
+                .remote_agents
+                .apply_update(*update, &mut self.state.next_agent_state_change_seq),
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
                 false
@@ -101,6 +105,13 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if let AppEvent::RemoteAgentsUpdated(update) = ev {
+            self.state
+                .remote_agents
+                .apply_update(*update, &mut self.state.next_agent_state_change_seq);
+            return;
+        }
+
         if let AppEvent::TerminalBell { count, .. } = ev {
             if let Err(err) =
                 crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)

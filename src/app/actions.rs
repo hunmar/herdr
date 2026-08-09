@@ -1499,59 +1499,81 @@ impl AppState {
     }
 
     #[cfg(test)]
-    pub fn next_agent(&mut self) {
-        self.cycle_agent_entry(true);
+    pub fn next_agent(&mut self) -> bool {
+        self.cycle_agent_entry(true)
     }
 
     #[cfg(test)]
-    pub fn previous_agent(&mut self) {
-        self.cycle_agent_entry(false);
+    pub fn previous_agent(&mut self) -> bool {
+        self.cycle_agent_entry(false)
     }
 
     #[cfg(test)]
     pub fn focus_agent_entry(&mut self, idx: usize) -> bool {
         let entries = crate::ui::agent_panel_entries(self);
-        let Some(target) = entries.get(idx) else {
+        let Some((visual_idx, ws_idx, pane_id)) = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(visual_idx, entry)| {
+                entry
+                    .local_target()
+                    .map(|(ws_idx, _, pane_id)| (visual_idx, ws_idx, pane_id))
+            })
+            .nth(idx)
+        else {
             return false;
         };
-        let ws_idx = target.ws_idx;
-        let pane_id = target.pane_id;
 
         if self.active == Some(ws_idx) && self.workspaces[ws_idx].focused_pane_id() == Some(pane_id)
         {
-            self.ensure_agent_panel_entry_visible(idx);
+            self.ensure_agent_panel_entry_visible(visual_idx);
             return true;
         }
 
         if self.focus_pane_in_workspace(ws_idx, pane_id) {
-            self.ensure_agent_panel_entry_visible(idx);
+            self.ensure_agent_panel_entry_visible(visual_idx);
             return true;
         }
         false
     }
 
     #[cfg(test)]
-    fn cycle_agent_entry(&mut self, forward: bool) {
+    fn cycle_agent_entry(&mut self, forward: bool) -> bool {
         let entries = crate::ui::agent_panel_entries(self);
         if entries.is_empty() {
-            return;
+            return false;
         }
 
-        let focused = self
-            .active
-            .and_then(|idx| self.workspaces.get(idx))
-            .and_then(crate::workspace::Workspace::focused_pane_id);
-        let current_idx =
-            focused.and_then(|pane_id| entries.iter().position(|entry| entry.pane_id == pane_id));
+        let focused = self.active.and_then(|ws_idx| {
+            self.workspaces
+                .get(ws_idx)
+                .and_then(crate::workspace::Workspace::focused_pane_id)
+                .map(|pane_id| (ws_idx, pane_id))
+        });
+        let local_entries = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(visual_idx, entry)| {
+                entry
+                    .local_target()
+                    .map(|(ws_idx, _, pane_id)| (visual_idx, ws_idx, pane_id))
+            })
+            .collect::<Vec<_>>();
+        if local_entries.is_empty() {
+            return false;
+        }
+        let current_idx = local_entries
+            .iter()
+            .position(|(_, ws_idx, pane_id)| Some((*ws_idx, *pane_id)) == focused);
         let target_idx = match (current_idx, forward) {
-            (Some(idx), true) => (idx + 1) % entries.len(),
-            (Some(0), false) => entries.len() - 1,
+            (Some(idx), true) => (idx + 1) % local_entries.len(),
+            (Some(0), false) => local_entries.len() - 1,
             (Some(idx), false) => idx - 1,
             (None, true) => 0,
-            (None, false) => entries.len() - 1,
+            (None, false) => local_entries.len() - 1,
         };
 
-        self.focus_agent_entry(target_idx);
+        self.focus_agent_entry(target_idx)
     }
 
     pub(crate) fn ensure_agent_panel_entry_visible(&mut self, idx: usize) {
@@ -2936,6 +2958,11 @@ impl AppState {
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            AppEvent::RemoteAgentsUpdated(update) => {
+                self.remote_agents
+                    .apply_update(*update, &mut self.next_agent_state_change_seq);
+                Vec::new()
+            }
         }
     }
 
@@ -4331,11 +4358,21 @@ mod tests {
 
         transition_agent_state(&mut state, first, AgentState::Idle);
         transition_agent_state(&mut state, second, AgentState::Working);
-        assert_eq!(crate::ui::agent_panel_entries(&state)[0].pane_id, second);
+        assert_eq!(
+            crate::ui::agent_panel_entries(&state)[0]
+                .local_target()
+                .map(|(_, _, pane_id)| pane_id),
+            Some(second)
+        );
 
         transition_agent_state(&mut state, second, AgentState::Idle);
 
-        assert_eq!(crate::ui::agent_panel_entries(&state)[0].pane_id, second);
+        assert_eq!(
+            crate::ui::agent_panel_entries(&state)[0]
+                .local_target()
+                .map(|(_, _, pane_id)| pane_id),
+            Some(second)
+        );
         state.assert_invariants_for_test();
     }
 

@@ -805,6 +805,13 @@
                 "null"
               ]
             },
+            "number": {
+              "default": 0,
+              "description": "Stable public number used by pane ordering and IDs.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "pane_id": {
               "type": "string"
             },
@@ -1033,6 +1040,11 @@
           "properties": {
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
+            },
+            "custom_label": {
+              "default": false,
+              "description": "True when `label` was explicitly assigned instead of generated from the tab position.",
+              "type": "boolean"
             },
             "focused": {
               "type": "boolean"
@@ -7437,6 +7449,13 @@
                 "null"
               ]
             },
+            "number": {
+              "default": 0,
+              "description": "Stable public number used by pane ordering and IDs.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "pane_id": {
               "type": "string"
             },
@@ -9882,6 +9901,11 @@
           "properties": {
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "custom_label": {
+              "default": false,
+              "description": "True when `label` was explicitly assigned instead of generated from the tab position.",
+              "type": "boolean"
             },
             "focused": {
               "type": "boolean"

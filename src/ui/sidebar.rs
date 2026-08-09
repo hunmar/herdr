@@ -20,10 +20,26 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentPanelTarget {
+    Local {
+        ws_idx: usize,
+        tab_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    Remote {
+        source: String,
+        pane_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentPanelEntry {
-    pub ws_idx: usize,
-    pub tab_idx: usize,
-    pub pane_id: crate::layout::PaneId,
+    pub target: AgentPanelTarget,
+    pub view_workspace_id: String,
+    pub view_tab_id: String,
+    pub view_pane_id: String,
+    pub order: (usize, usize, usize, usize),
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub pane_label: Option<String>,
@@ -37,6 +53,24 @@ pub(crate) struct AgentPanelEntry {
     pub last_agent_state_change_seq: Option<u64>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
+}
+
+impl AgentPanelEntry {
+    pub(crate) fn local_target(&self) -> Option<(usize, usize, crate::layout::PaneId)> {
+        match self.target {
+            AgentPanelTarget::Local {
+                ws_idx,
+                tab_idx,
+                pane_id,
+            } => Some((ws_idx, tab_idx, pane_id)),
+            AgentPanelTarget::Remote { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_active(&self, app: &AppState) -> bool {
+        self.local_target()
+            .is_some_and(|(ws_idx, tab_idx, pane_id)| app.is_active_pane(ws_idx, tab_idx, pane_id))
+    }
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -94,7 +128,7 @@ fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
         return Rect::default();
     }
 
-    let width = display_width_u16(label).min(area.width);
+    let width = display_width_u16(label).min(area.width / 2);
     Rect::new(
         area.x + area.width.saturating_sub(width),
         area.y + 1,
@@ -146,7 +180,8 @@ fn collect_agent_panel_entries_with_runtimes(
         }
     };
 
-    app.workspaces
+    let mut entries = app
+        .workspaces
         .iter()
         .enumerate()
         .flat_map(|(ws_idx, ws)| {
@@ -161,9 +196,30 @@ fn collect_agent_panel_entries_with_runtimes(
                             .get(detail.tab_idx)
                             .is_some_and(|tab| !tab.is_auto_named());
                     AgentPanelEntry {
-                        ws_idx,
-                        tab_idx: detail.tab_idx,
-                        pane_id: detail.pane_id,
+                        target: AgentPanelTarget::Local {
+                            ws_idx,
+                            tab_idx: detail.tab_idx,
+                            pane_id: detail.pane_id,
+                        },
+                        view_workspace_id: ws.id.clone(),
+                        view_tab_id: ws
+                            .public_tab_number(detail.tab_idx)
+                            .map(|number| {
+                                crate::workspace::public_tab_id_for_number(&ws.id, number)
+                            })
+                            .unwrap_or_default(),
+                        view_pane_id: ws
+                            .public_pane_number(detail.pane_id)
+                            .map(|number| {
+                                crate::workspace::public_pane_id_for_number(&ws.id, number)
+                            })
+                            .unwrap_or_default(),
+                        order: (
+                            0,
+                            ws_idx,
+                            ws.public_tab_number(detail.tab_idx).unwrap_or(usize::MAX),
+                            ws.public_pane_number(detail.pane_id).unwrap_or(usize::MAX),
+                        ),
                         primary_label: workspace_label.clone(),
                         primary_tab_label: show_tab.then_some(detail.tab_label),
                         pane_label: detail.pane_label,
@@ -180,7 +236,75 @@ fn collect_agent_panel_entries_with_runtimes(
                     }
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    for remote in app.remote_agents.panel_agents() {
+        let presentation = remote.presentation;
+        let mut state_labels = presentation.state_labels;
+        let tokens = presentation.tokens;
+        if !remote.online {
+            state_labels.insert("unknown".to_string(), "offline".to_string());
+        }
+        let source_qualifier = remote_source_qualifier(&remote.host_key);
+        entries.push(AgentPanelEntry {
+            target: AgentPanelTarget::Remote {
+                source: remote.host_key,
+                pane_id: presentation.pane_id.clone(),
+            },
+            view_workspace_id: qualify_remote_view_id(
+                &source_qualifier,
+                &presentation.workspace_id,
+            ),
+            view_tab_id: qualify_remote_view_id(&source_qualifier, &presentation.tab_id),
+            view_pane_id: qualify_remote_view_id(&source_qualifier, &presentation.pane_id),
+            order: (
+                remote.host_order.saturating_add(1),
+                presentation.order.0,
+                presentation.order.1,
+                presentation.order.2,
+            ),
+            primary_label: format!(
+                "{}{} · {}",
+                remote.host_label,
+                if remote.online { "" } else { " (offline)" },
+                presentation.workspace_label
+            ),
+            primary_tab_label: presentation.tab_label,
+            pane_label: presentation.pane_label,
+            terminal_title: presentation.terminal_title,
+            terminal_title_stripped: presentation.terminal_title_stripped,
+            agent_label: Some(presentation.agent_label),
+            agent_kind_label: presentation.agent_kind_label,
+            agent: presentation.agent,
+            state: if remote.online {
+                presentation.state
+            } else {
+                AgentState::Unknown
+            },
+            seen: if remote.online {
+                presentation.seen
+            } else {
+                true
+            },
+            last_agent_state_change_seq: remote.state_change_seq,
+            state_labels,
+            tokens,
+        });
+    }
+    entries
+}
+
+fn remote_source_qualifier(source: &str) -> String {
+    let mut encoded = String::with_capacity(source.len().saturating_mul(2));
+    for byte in source.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn qualify_remote_view_id(source: &str, raw: &str) -> String {
+    format!("remote:{source}:{raw}")
 }
 
 pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static str {
@@ -829,6 +953,23 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             buf[(x, divider_y)].set_symbol("─");
             buf[(x, divider_y)].set_style(Style::default().fg(divider_color));
         }
+        let unavailable_sources = app.remote_agents.unavailable_source_count();
+        if unavailable_sources > 0 {
+            let label = format!("!{unavailable_sources}");
+            let width = display_width_u16(&label).min(ws_area.width);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(
+                    ws_area.x + ws_area.width.saturating_sub(width),
+                    divider_y,
+                    width,
+                    1,
+                ),
+            );
+        }
     }
 
     let detail_content_area = Rect::new(
@@ -838,13 +979,20 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
         detail_area.height.saturating_sub(1),
     );
     if detail_content_area != Rect::default() {
-        for (detail_idx, detail) in agent_panel_entries(app).iter().enumerate() {
+        let details = agent_panel_entries(app);
+        let mut local_position = 0usize;
+        for (detail_idx, detail) in details.iter().enumerate() {
             let y = detail_content_area.y + detail_idx as u16;
             if y >= detail_content_area.y + detail_content_area.height {
                 break;
             }
-            let position = detail_idx + 1;
-            let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+            let position = if detail.local_target().is_some() {
+                local_position = local_position.saturating_add(1);
+                local_position.to_string()
+            } else {
+                "r".to_string()
+            };
+            let is_active = detail.is_active(app);
             let position_style = if is_active {
                 Style::default().fg(p.text).bg(p.surface_dim)
             } else {
@@ -1438,16 +1586,27 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        )])),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+    let unavailable_sources = app.remote_agents.unavailable_source_count();
+    let title = if unavailable_sources == 0 {
+        " agents".to_string()
+    } else {
+        format!("!{unavailable_sources} agents")
+    };
     let control_label = active_agent_view_label(app)
         .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
     let toggle_rect = agent_panel_header_label_rect(area, control_label);
+    let title_width = if toggle_rect == Rect::default() {
+        area.width
+    } else {
+        toggle_rect.x.saturating_sub(area.x)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(area.x, area.y + 1, title_width, 1),
+    );
     if toggle_rect != Rect::default() {
         let color = if app.agent_view_override.is_some() {
             p.accent
@@ -1491,7 +1650,7 @@ fn render_agent_detail(
             break;
         }
 
-        let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+        let is_active = detail.is_active(app);
         let row_style = if is_active {
             Style::default().bg(p.surface_dim)
         } else {
@@ -1864,6 +2023,39 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(metrics.max_offset_from_bottom, 0);
         assert_eq!(row_text(buffer, body.y, body.width), " pi");
         assert_eq!(row_text(buffer, body.y + 1, body.width), " claude");
+    }
+
+    #[test]
+    fn narrow_agent_header_keeps_unavailable_count_and_sort_control_distinct() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_sort = AgentPanelSort::Priority;
+        let registrations = (0..32)
+            .map(|index| {
+                let source = crate::config::RemoteAgentSourceConfig {
+                    target: format!("box-{index}"),
+                    label: None,
+                    session: "default".into(),
+                };
+                crate::remote_agents::RemoteHostRegistration {
+                    key: crate::remote_agents::RemoteHostKey::for_source(&source),
+                    label: source.fleet_label(),
+                    generation: index as u64 + 1,
+                    order: index,
+                }
+            })
+            .collect::<Vec<_>>();
+        app.remote_agents.reconcile(&registrations);
+
+        let area = Rect::new(0, 0, 18, 8);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_agent_detail(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let header = row_text(terminal.backend().buffer(), area.y + 1, area.width);
+
+        assert!(header.contains("!32 agents"), "header: {header:?}");
+        assert!(header.contains("priority"), "header: {header:?}");
+        assert_eq!(agent_panel_toggle_rect(area, app.agent_panel_sort).width, 8);
     }
 
     #[test]
@@ -2379,7 +2571,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .seen = false;
 
         assert_eq!(app.workspaces[1].public_pane_number(urgent_pane), Some(2));
-        assert_eq!(agent_panel_entries(&app)[0].pane_id, urgent_pane);
+        assert_eq!(
+            agent_panel_entries(&app)[0]
+                .local_target()
+                .map(|(_, _, pane_id)| pane_id),
+            Some(urgent_pane)
+        );
 
         let area = Rect::new(0, 0, 4, 16);
         let (_, _, detail_area) = collapsed_sidebar_sections(area);
