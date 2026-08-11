@@ -180,6 +180,9 @@ fn collect_agent_panel_entries_with_runtimes(
         }
     };
 
+    // Local view ids only feed agent-view field evaluation; skip formatting
+    // them on the per-frame path when no agent view is active.
+    let build_view_ids = app.agent_view_override.is_some();
     let mut entries = app
         .workspaces
         .iter()
@@ -195,6 +198,8 @@ fn collect_agent_panel_entries_with_runtimes(
                             .tabs
                             .get(detail.tab_idx)
                             .is_some_and(|tab| !tab.is_auto_named());
+                    let tab_number = ws.public_tab_number(detail.tab_idx);
+                    let pane_number = ws.public_pane_number(detail.pane_id);
                     AgentPanelEntry {
                         target: AgentPanelTarget::Local {
                             ws_idx,
@@ -202,23 +207,27 @@ fn collect_agent_panel_entries_with_runtimes(
                             pane_id: detail.pane_id,
                         },
                         view_workspace_id: ws.id.clone(),
-                        view_tab_id: ws
-                            .public_tab_number(detail.tab_idx)
-                            .map(|number| {
-                                crate::workspace::public_tab_id_for_number(&ws.id, number)
+                        view_tab_id: build_view_ids
+                            .then(|| {
+                                tab_number.map(|number| {
+                                    crate::workspace::public_tab_id_for_number(&ws.id, number)
+                                })
                             })
+                            .flatten()
                             .unwrap_or_default(),
-                        view_pane_id: ws
-                            .public_pane_number(detail.pane_id)
-                            .map(|number| {
-                                crate::workspace::public_pane_id_for_number(&ws.id, number)
+                        view_pane_id: build_view_ids
+                            .then(|| {
+                                pane_number.map(|number| {
+                                    crate::workspace::public_pane_id_for_number(&ws.id, number)
+                                })
                             })
+                            .flatten()
                             .unwrap_or_default(),
                         order: (
                             0,
                             ws_idx,
-                            ws.public_tab_number(detail.tab_idx).unwrap_or(usize::MAX),
-                            ws.public_pane_number(detail.pane_id).unwrap_or(usize::MAX),
+                            tab_number.unwrap_or(usize::MAX),
+                            pane_number.unwrap_or(usize::MAX),
                         ),
                         primary_label: workspace_label.clone(),
                         primary_tab_label: show_tab.then_some(detail.tab_label),

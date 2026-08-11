@@ -144,6 +144,7 @@ struct FleetAgentInfo {
     terminal_title_stripped: Option<String>,
     #[serde(default)]
     display_agent: Option<String>,
+    #[serde(deserialize_with = "agent_status_or_unknown")]
     agent_status: AgentStatus,
     #[serde(default)]
     state_labels: HashMap<String, String>,
@@ -152,6 +153,17 @@ struct FleetAgentInfo {
     workspace_id: String,
     tab_id: String,
     pane_id: String,
+}
+
+/// A newer remote may report status names this build does not know without an
+/// incompatible wire change; degrade them to `Unknown` instead of failing the
+/// whole snapshot.
+fn agent_status_or_unknown<'de, D>(deserializer: D) -> Result<AgentStatus, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(serde_json::from_value(serde_json::Value::String(value)).unwrap_or(AgentStatus::Unknown))
 }
 
 #[derive(Debug)]
@@ -295,9 +307,10 @@ impl RemoteAgentRegistry {
         );
         match kind {
             RemoteAgentUpdateKind::Offline { error } => {
-                let changed = host.online;
+                let last_error = Some(sanitize_remote_text(&error, MAX_REMOTE_TEXT_CHARS));
+                let changed = host.online || host.last_error != last_error;
                 host.online = false;
-                host.last_error = Some(sanitize_remote_text(&error, MAX_REMOTE_TEXT_CHARS));
+                host.last_error = last_error;
                 changed
             }
             RemoteAgentUpdateKind::Snapshot(snapshot) => {
@@ -395,6 +408,10 @@ struct RemoteAgentWatcher {
 #[derive(Default)]
 pub(crate) struct RemoteAgentSupervisor {
     watchers: HashMap<RemoteHostKey, RemoteAgentWatcher>,
+    /// Cancelled watchers whose threads have not exited yet. Reconcile runs on
+    /// the event thread, so they are reaped once finished instead of joined
+    /// synchronously; Drop joins whatever is left.
+    retired: Vec<RemoteAgentWatcher>,
     next_generation: u64,
 }
 
@@ -433,7 +450,6 @@ impl RemoteAgentSupervisor {
             .filter(|key| !wanted.contains(*key))
             .cloned()
             .collect::<Vec<_>>();
-        let mut stopped = Vec::new();
         let finished = self
             .watchers
             .iter()
@@ -442,18 +458,24 @@ impl RemoteAgentSupervisor {
             .collect::<Vec<_>>();
         for key in finished {
             if let Some(watcher) = self.watchers.remove(&key) {
-                stopped.push(watcher);
+                join_watcher(watcher);
             }
         }
         for key in removed {
             if let Some(watcher) = self.watchers.remove(&key) {
                 watcher.cancel.store(true, Ordering::Release);
-                stopped.push(watcher);
+                self.retired.push(watcher);
             }
         }
-        for watcher in stopped {
-            join_watcher(watcher);
+        let mut still_running = Vec::new();
+        for watcher in self.retired.drain(..) {
+            if watcher.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+                join_watcher(watcher);
+            } else {
+                still_running.push(watcher);
+            }
         }
+        self.retired = still_running;
 
         let mut registrations = Vec::with_capacity(sources.len());
         for (order, source) in sources.into_iter().enumerate() {
@@ -533,6 +555,7 @@ impl Drop for RemoteAgentSupervisor {
             .drain()
             .map(|(_, watcher)| watcher)
             .collect::<Vec<_>>();
+        watchers.append(&mut self.retired);
         for watcher in &watchers {
             watcher.cancel.store(true, Ordering::Release);
         }
@@ -582,19 +605,26 @@ fn run_watcher(
             last_error_log_at = Some(Instant::now());
         }
 
-        let Some(update) = RemoteAgentUpdate::tracked(
-            host.clone(),
-            generation,
-            RemoteAgentUpdateKind::Offline {
-                error: outcome.error,
-            },
-            &pending,
-        ) else {
-            if cancelable_sleep(&cancel, reconnect_delay) {
+        if outcome.received_snapshot {
+            reconnect_delay = Duration::from_secs(1);
+        }
+
+        let update = loop {
+            if let Some(update) = RemoteAgentUpdate::tracked(
+                host.clone(),
+                generation,
+                RemoteAgentUpdateKind::Offline {
+                    error: outcome.error.clone(),
+                },
+                &pending,
+            ) {
+                break update;
+            }
+            // The last snapshot event is still queued in the app channel; wait
+            // for it to drain so the offline notice is never silently dropped.
+            if cancelable_sleep(&cancel, WATCHER_POLL_INTERVAL) {
                 return;
             }
-            reconnect_delay = reconnect_delay.saturating_mul(2).min(RECONNECT_MAX_DELAY);
-            continue;
         };
         let update = AppEvent::RemoteAgentsUpdated(Box::new(update));
         if matches!(
@@ -602,10 +632,6 @@ fn run_watcher(
             Err(mpsc::error::TrySendError::Closed(_))
         ) {
             return;
-        }
-
-        if outcome.received_snapshot {
-            reconnect_delay = Duration::from_secs(1);
         }
         if cancelable_sleep(&cancel, reconnect_delay) {
             return;
@@ -703,8 +729,11 @@ fn stream_remote_snapshots(
                 if last_processed
                     .is_some_and(|last: Instant| last.elapsed() < MIN_SNAPSHOT_PROCESS_INTERVAL)
                 {
-                    error = Some("remote snapshot stream produced frames too quickly".to_string());
-                    break;
+                    // A transient network stall can flush queued frames in one
+                    // burst; drop the extras instead of tearing the stream down.
+                    // A remote that never slows down still hits the stall
+                    // timeout because skipped frames leave last_output alone.
+                    continue;
                 }
                 last_processed = Some(Instant::now());
                 match parse_snapshot_line(&line) {
@@ -837,19 +866,8 @@ fn snapshot_stream_command(source: &RemoteAgentSourceConfig) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::platform::configure_background_command(&mut command);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::platform::detach_server_daemon_command(&mut command);
     command
 }
 
@@ -1729,6 +1747,19 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("unknown workspace"));
+    }
+
+    #[test]
+    fn parser_degrades_unrecognized_agent_status_to_unknown() {
+        let line = format!(
+            r#"{{"result":{{"type":"session_snapshot","snapshot":{{"version":"0.8.0","protocol":{},"workspaces":[{{"workspace_id":"w1","label":"repo"}}],"tabs":[{{"tab_id":"t1","workspace_id":"w1","number":1,"label":"1"}}],"panes":[{{"pane_id":"p1","number":1,"terminal_id":"term1","workspace_id":"w1","tab_id":"t1"}}],"agents":[{{"terminal_id":"term1","agent":"claude","agent_status":"hibernating","workspace_id":"w1","tab_id":"t1","pane_id":"p1"}}]}}}}}}"#,
+            crate::protocol::PROTOCOL_VERSION
+        );
+
+        let parsed = parse_snapshot_line(line.as_bytes()).unwrap();
+
+        assert_eq!(parsed.agents[0].state, AgentState::Unknown);
+        assert!(parsed.agents[0].seen);
     }
 
     #[test]
