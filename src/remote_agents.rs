@@ -38,6 +38,12 @@ impl RemoteHostKey {
     pub(crate) fn for_source(source: &RemoteAgentSourceConfig) -> Self {
         Self(format!("{}\u{1f}{}", source.target, source.session))
     }
+
+    /// Inverse of `for_source` for raw key strings: splits a host key back
+    /// into its `(target, session)` parts.
+    pub(crate) fn split_key(key: &str) -> (&str, &str) {
+        key.split_once('\u{1f}').unwrap_or((key, ""))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1331,6 +1337,18 @@ fn presentation_state(status: AgentStatus) -> (AgentState, bool) {
     }
 }
 
+/// Inverse of `presentation_state`, used to report stored remote agents back
+/// out through the JSON API.
+pub(crate) fn agent_status_for_presentation(state: AgentState, seen: bool) -> AgentStatus {
+    match (state, seen) {
+        (AgentState::Idle, true) => AgentStatus::Idle,
+        (AgentState::Idle, false) => AgentStatus::Done,
+        (AgentState::Working, _) => AgentStatus::Working,
+        (AgentState::Blocked, _) => AgentStatus::Blocked,
+        (AgentState::Unknown, _) => AgentStatus::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,6 +1734,7 @@ mod tests {
                         foreground_cwd: None,
                         revision: 1,
                     }],
+                    remote_agents: Vec::new(),
                 }),
             },
         };

@@ -8638,6 +8638,114 @@
           ],
           "type": "string"
         },
+        "RemoteAgentInfo": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_status": {
+              "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "display_agent": {
+              "type": "string"
+            },
+            "pane_id": {
+              "description": "Pane id within the remote session.",
+              "type": "string"
+            },
+            "source_label": {
+              "type": "string"
+            },
+            "source_online": {
+              "description": "Whether the source's snapshot stream is currently connected.",
+              "type": "boolean"
+            },
+            "source_session": {
+              "description": "Remote session name of the source.",
+              "type": "string"
+            },
+            "source_target": {
+              "description": "Connection target of the remote agent source this agent came from.",
+              "type": "string"
+            },
+            "state_change_seq": {
+              "description": "Local observation sequence bumped when the agent's status changes.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "state_labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "tab_id": {
+              "description": "Tab id within the remote session.",
+              "type": "string"
+            },
+            "tab_label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_title_stripped": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "workspace_id": {
+              "description": "Workspace id within the remote session.",
+              "type": "string"
+            },
+            "workspace_label": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_target",
+            "source_session",
+            "source_label",
+            "source_online",
+            "workspace_id",
+            "tab_id",
+            "pane_id",
+            "workspace_label",
+            "display_agent",
+            "agent_status"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -9862,6 +9970,13 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "remote_agents": {
+              "description": "Agents observed on configured remote agent sources. Read-only in this\nprotocol: their ids belong to the remote session and cannot be used as\ntargets for local commands.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/RemoteAgentInfo"
+              },
+              "type": "array"
             },
             "tabs": {
               "items": {
